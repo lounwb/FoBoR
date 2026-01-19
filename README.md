@@ -1,9 +1,7 @@
 # FoBoR: Enhancing Few-Shot Out-of-Distribution Detection via the Refinement of Foreground and Background
-<div>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-
-</div>
 
 ## 📰 News
 
@@ -71,9 +69,9 @@ CUDA_VISIBLE_DEVICES=1 bash scripts/eval.sh \
 
 ## 🙇‍♂️ Acknowledgement
 We appreciate the following papers for their open-source code:
-* [LoCoOp](https://github.com/AtsuMiyai/LoCoOp)
-* [SCT](https://github.com/warriors-30/SCT)
-* [Mambo](https://github.com/YuzunoKawori/Mambo)
+* [LoCoOp: Few-Shot Out-of-Distribution Detection via Prompt Learning](https://github.com/AtsuMiyai/LoCoOp)
+* [SCT: Self-Calibrated Tuning of Vision-Language Models for Out-of-Distribution Detection](https://github.com/warriors-30/SCT)
+* [Mambo: Background Prompt for Few-Shot Out-of-Distribution Detection](https://github.com/YuzunoKawori/Mambo)
 
 We also thank the [Dassl.pytorch](https://github.com/KaiyangZhou/Dassl.pytorch) framework for its valuable contribution.
 
