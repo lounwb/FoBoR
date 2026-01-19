@@ -686,7 +686,7 @@ class SCTCoCo(TrainerX):
         superimposed_img = cv2.addWeighted(heatmap, 0.5, image_np, 0.5, 0)
 
         # 保存结果
-        cv2.imwrite('/home/litianyu/projects/Mambo/output/viz/SCTCOCO/attention/attention_map.jpg', superimposed_img)
+        # cv2.imwrite('attention_map.jpg', superimposed_img)
 
         # input()
 
