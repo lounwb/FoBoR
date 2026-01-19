@@ -1,6 +1,5 @@
 # FoBoR: Enhancing Few-Shot Out-of-Distribution Detection via the Refinement of Foreground and Background
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 
 ## 📰 News
