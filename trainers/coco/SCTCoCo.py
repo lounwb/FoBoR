@@ -1,0 +1,708 @@
+import os.path as osp
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.cuda.amp import GradScaler, autocast
+
+from dassl.engine import TRAINER_REGISTRY, TrainerX
+from dassl.metrics import compute_accuracy
+from dassl.utils import load_pretrained_weights, load_checkpoint
+from dassl.optim import build_optimizer, build_lr_scheduler
+
+from clip_w_local import clip
+from clip_w_local.simple_tokenizer import SimpleTokenizer as _Tokenizer
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+import cv2
+
+
+
+_tokenizer = _Tokenizer()
+softmax = nn.Softmax(dim=1).cuda()
+
+
+
+def confusable_foreground_rectification_module(
+    output,
+    output_local,
+    text_sim,
+    label,
+    true_probs=None,
+    alpha=0.83,
+    beta=0.17,
+    num_confuse_classes=1,
+    num_confuse_patches=1,
+    eps=1e-5,
+):
+    """
+    Compute confusion loss for local regions that are highly similar to
+    the most confusing (non-ground-truth) class, weighted by true_probs (if provided).
+
+    Args:
+        output:         [B, C] global logits (image-text similarity)
+        output_local:   [B, L, C] local logits (each patch)
+        text_sim:       [C, C] text-text cosine similarity matrix
+        label:          [B] ground truth class indices
+        true_probs:     [B] per-sample weight (e.g., model's true class probability)
+        alpha, beta:    weights for fusing image-text vs text-text similarity
+        num_confuse_classes: number of top confusing classes to consider
+        num_confuse_patches: number of top local patches to use per confused class
+        eps:            small value for numerical stability
+
+    Returns:
+        loss_confuse:   scalar tensor (mean weighted confusion loss)
+    """
+    B, C = output.shape
+    if output_local.dim() != 3:
+        raise RuntimeError("output_local must be of shape [B, L, C]")
+    L = output_local.shape[1]
+
+    # 1. fusion similarity from textual modality and visual modality
+    text_sim_for_each_sample = text_sim[label]  # [B, C]
+    fused = alpha * output + beta * text_sim_for_each_sample
+    fused[torch.arange(B), label] = float("-inf")
+
+    _, topk_wrong_indices = torch.topk(
+        fused, k=num_confuse_classes, dim=1
+    )  # [B, K_cls]
+
+    output_local_flat = output_local.view(B * L, C)
+    p_flat = F.softmax(output_local_flat, dim=-1)
+
+    total_entropy_per_sample = 0.0
+
+    for k in range(num_confuse_classes):
+        wrong_idx = topk_wrong_indices[:, k]  # [B]
+
+        # 2. select local regions most similar to confusable class
+        wrong_local_sim = output_local[torch.arange(B), :, wrong_idx]  # [B, L]
+        topk_vals, topk_idx = torch.topk(wrong_local_sim, k=num_confuse_patches, dim=1)
+
+        batch_idx = (
+            torch.arange(B, device=output.device)
+            .unsqueeze(1)
+            .repeat(1, num_confuse_patches)
+        )
+        flat_indices = (batch_idx * L + topk_idx).view(-1)
+
+        selected_p = p_flat[flat_indices]  # [B * num_confuse_patches, C]
+        label_repeat = label.repeat_interleave(num_confuse_patches)
+        wrong_idx_repeat = wrong_idx.repeat_interleave(num_confuse_patches)
+
+        p_y = selected_p[torch.arange(selected_p.size(0)), label_repeat]
+        p_wrong = selected_p[torch.arange(selected_p.size(0)), wrong_idx_repeat]
+
+        p_pair = torch.stack([p_y, p_wrong], dim=1)
+        p_pair = p_pair / (p_pair.sum(dim=1, keepdim=True) + 1e-4)
+        entropy_per_patch = -torch.sum(
+            p_pair * torch.log(p_pair + eps), dim=1
+        )  # [B * num_confuse_patches]
+
+        # 3. reshape to [B, num_confuse_patches] for weighting
+        entropy_per_sample = entropy_per_patch.view(B, num_confuse_patches).mean(
+            dim=1
+        )  # [B]
+        total_entropy_per_sample = total_entropy_per_sample + entropy_per_sample
+
+    weighted_loss = total_entropy_per_sample / num_confuse_classes
+
+    loss_confuse = -weighted_loss.mean()  # scalar
+
+    return loss_confuse
+
+def adaptive_background_supression_module(
+    p: torch.Tensor,  # shape: (B, P, C)
+    top_k: torch.Tensor,  # shape: (B,)
+    label: torch.Tensor,  # shape: (B,)
+    global_probs: torch.Tensor,  # global probs, shape: (B, n_cls)
+    attn_scores: torch.Tensor = None,  # shape: (B, P)
+    eta: int = 5.0,
+):
+    """
+    Extract non-Top-K regions and calculate entropy.
+    """
+    B, P, C = p.shape
+
+    p = p.view(B * P, -1)  # shape: (B * P, n_cls)
+
+    device = p.device
+    # attn_scores min-max normalize (per sample)
+    attn_min = attn_scores.min(dim=1, keepdim=True)[0]
+    attn_max = attn_scores.max(dim=1, keepdim=True)[0]
+    attn_scores = (attn_scores - attn_min) / (attn_max - attn_min + 1e-8)
+
+    attn_scores = attn_scores.reshape(-1)  # shape: (B * P,)
+    # 1. compute local sim & global sim and broadcast
+    p = F.softmax(p, dim=-1)  # shape: (B * P, n_cls), local sim
+    true_probs = torch.gather(
+        global_probs, 1, (label.unsqueeze(1)).long()
+    ).squeeze()  # shape: (B,), global sim
+    true_probs_repeat = true_probs.repeat_interleave(P)  # shape: (B * P,)
+    label_repeat = label.repeat_interleave(P).to(device)  # shape: (B * P, )
+
+    # 2. get non-Top-K regions
+    _, pred_topk = torch.topk(p, k=top_k, dim=1)  # shape: (B*P, top_k)
+    # label_idx = label_repeat.unsqueeze(1).long()  # shape: (B*P, 1)
+
+    contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(
+        dim=1
+    )  # shape: (B*P, )
+
+    # 3. select non-Top-K regions
+    selected_p = p[~contains_label]  # shape: (N, n_cls)
+    selected_true_probs = true_probs_repeat.to(device)[~contains_label]  # shape: (N,)
+    selected_attn_scores = attn_scores[~contains_label]  # shape: (N,)
+
+    # if no selected regions, return zero on correct device
+    if selected_p.shape[0] == 0:
+        return torch.tensor(0.0).to(device)
+
+    # 4. compute weights for selected regions
+    weights_before = selected_true_probs * selected_attn_scores
+    # Optional: z-score normalize
+    # weights_before = (weights_before - weights_before.mean()) / (weights_before.std() + 1e-8)
+    weights = torch.sigmoid(eta * weights_before)
+    weights = weights.unsqueeze(dim=1)  # shape: (N, 1)
+
+    loss = torch.sum(weights * selected_p * torch.log(selected_p + 1e-5), dim=1) * (0.0000001 + selected_true_probs) 
+
+    return torch.mean(loss)
+
+
+def load_clip_to_cpu(cfg):
+    backbone_name = cfg.MODEL.BACKBONE.NAME
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
+
+    try:
+        # loading JIT archive
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
+
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu")
+
+    model = clip.build_model(state_dict or model.state_dict())
+
+    return model
+
+
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x, _, _, _ = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
+        return x
+
+
+class PromptLearner(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        n_cls = len(classnames)
+        n_ctx = cfg.TRAINER.SCTCOCO.N_CTX
+        ctx_init = cfg.TRAINER.SCTCOCO.CTX_INIT
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        clip_imsize = clip_model.visual.input_resolution
+        cfg_imsize = cfg.INPUT.SIZE[0]
+        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+        if ctx_init:
+            # use given words to initialize context vectors
+            ctx_init = ctx_init.replace("_", " ")
+            n_ctx = len(ctx_init.split(" "))
+            prompt = clip.tokenize(ctx_init)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = ctx_init
+
+        else:
+            # random initialization
+            if cfg.TRAINER.SCTCOCO.CSC:
+                print("Initializing class-specific contexts")
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+            else:
+                print("Initializing a generic context")
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+
+        classnames = [name.replace("_", " ") for name in classnames]
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.name_lens = name_lens
+        self.class_token_position = cfg.TRAINER.SCTCOCO.CLASS_TOKEN_POSITION
+
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        if self.class_token_position == "end":
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+
+        elif self.class_token_position == "middle":
+            half_n_ctx = self.n_ctx // 2
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
+                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,     # (1, 1, dim)
+                        ctx_i_half1,  # (1, n_ctx//2, dim)
+                        class_i,      # (1, name_len, dim)
+                        ctx_i_half2,  # (1, n_ctx//2, dim)
+                        suffix_i,     # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        elif self.class_token_position == "front":
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i = ctx[i : i + 1, :, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        class_i,   # (1, name_len, dim)
+                        ctx_i,     # (1, n_ctx, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        else:
+            raise ValueError
+
+        return prompts
+
+
+class CustomCLIP(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+    def forward(self, image):
+        image_features, local_image_features, attn_scores = self.image_encoder(
+            image.type(self.dtype),
+            attn=True
+        )
+
+        prompts = self.prompt_learner()
+        tokenized_prompts = self.tokenized_prompts
+
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        logit_scale = self.logit_scale.exp()
+
+        text_sim = logit_scale * text_features @ text_features.t()   # [num_classes, num_classes]
+        logits = logit_scale * image_features @ text_features.t()
+        logits_local = logit_scale * local_image_features @ text_features.T
+
+        return logits, logits_local, text_sim, attn_scores
+
+
+@TRAINER_REGISTRY.register()
+class SCTCoCo(TrainerX):
+    """Local regularized Context Optimization (SCTCOCO).
+    """
+
+    def check_cfg(self, cfg):
+        assert cfg.TRAINER.SCTCOCO.PREC in ["fp16", "fp32", "amp"]
+
+    def build_model(self):
+        cfg = self.cfg
+        classnames = self.dm.dataset.classnames
+
+        # Hyperparameters for CoCo
+        self.alpha_value = getattr(cfg, "alpha_value", 0.2)
+        self.beta_value = getattr(cfg, "beta_value", 3.0)
+        self.top_k = getattr(cfg, "top_k", 200)
+        self.num_classes = getattr(cfg, "num_classes", 1)
+        self.num_patches = getattr(cfg, "num_patches", 1)
+        self.eta = getattr(cfg, "eta", 5.0)
+        self.lambda_value = getattr(cfg, "lambda_value", 0.8)
+
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        clip_model = load_clip_to_cpu(cfg)
+
+        if cfg.TRAINER.SCTCOCO.PREC == "fp32" or cfg.TRAINER.SCTCOCO.PREC == "amp":
+            # CLIP's default precision is fp16
+            clip_model.float()
+
+        print("Building custom CLIP")
+        self.model = CustomCLIP(cfg, classnames, clip_model)
+        for param in self.model.parameters():
+            param.requires_grad_(False)
+        print("Turning off gradients in both the image and the text encoder")
+        for name, param in self.model.named_parameters():
+            if "prompt_learner" in name: 
+                param.requires_grad_(True)
+
+        # or "semantic_adapter" in name or "background_adapter" in name or "measure" in name or "alignment"
+
+        print("Unfrozen parameters:")
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                print(f"Layer: {name} | Size: {param.size()}")
+        if cfg.MODEL.INIT_WEIGHTS:
+            load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
+
+        self.model.to(self.device)
+        # NOTE: only give prompt_learner to the optimizer
+        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        self.register_model("model", self.model, self.optim, self.sched)
+
+        self.scaler = GradScaler() if cfg.TRAINER.SCTCOCO.PREC == "amp" else None
+
+        # Note that multi-gpu training could be slow because CLIP's size is
+        # big, which slows down the copy operation in DataParallel
+        device_count = torch.cuda.device_count()
+        if device_count > 1:
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+            self.model = nn.DataParallel(self.model)
+
+    def forward_backward(self, batch):
+        image, label = self.parse_batch_train(batch)
+
+        prec = self.cfg.TRAINER.SCTCOCO.PREC
+
+        if prec == "amp":
+            with autocast():
+                output, output_local, text_sim, attn_scores = self.model(image)
+
+                label_onehot = F.one_hot(label, num_classes=self.num_classes)
+                probs = F.softmax(output, dim=1)
+                true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
+                # calculate CoOp loss
+                # loss_id = F.cross_entropy(output, label)
+                loss_id = - torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
+                loss_id = loss_id.mean()
+                # calculate CFR loss
+                loss_cfr = confusable_foreground_rectification_module(
+                    output=output, 
+                    output_local=output_local, 
+                    text_sim=text_sim, 
+                    label=label, 
+                    lambda_value=self.lambda_value,
+                    num_confuse_classes=self.num_classes,
+                    num_confuse_patches=self.num_patches,
+                    true_probs=true_probs, 
+                    cfg=self.cfg
+                )
+
+                # calculate ABS loss
+                loss_abs = adaptive_background_supression_module(
+                    p=output_local, 
+                    top_k=self.top_k, 
+                    label=label, 
+                    global_probs=probs, 
+                    attn_scores=attn_scores, 
+                    eta=self.eta
+                )
+
+                # calculate total loss for SCTCoCo
+                loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
+                
+
+            self.optim.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optim)
+            self.scaler.update()
+        else:
+            output, output_local, text_sim, attn_scores = self.model(image)
+
+            label_onehot = F.one_hot(label, num_classes=self.num_classes)
+            probs = F.softmax(output, dim=1)
+            true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
+            # calculate CoOp loss
+            # loss_id = F.cross_entropy(output, label)
+            loss_id = - torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
+            loss_id = loss_id.mean()
+            # calculate CFR loss
+            loss_cfr = confusable_foreground_rectification_module(
+                output=output, 
+                output_local=output_local, 
+                text_sim=text_sim, 
+                label=label, 
+                lambda_value=self.lambda_value,
+                num_confuse_classes=self.num_classes,
+                num_confuse_patches=self.num_patches,
+                true_probs=true_probs, 
+                cfg=self.cfg
+            )
+
+            # calculate ABS loss
+            loss_abs = adaptive_background_supression_module(
+                p=output_local, 
+                top_k=self.top_k, 
+                label=label, 
+                global_probs=probs, 
+                attn_scores=attn_scores, 
+                eta=self.eta
+            )
+
+            # calculate total loss for SCTCOCO
+            loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
+            self.model_backward_and_update(loss)
+
+        loss_summary = {
+            "loss": loss.item(),
+            "loss_id": loss_id.item(),
+            "loss_abs": loss_abs.item(),
+            "loss_cfr": loss_cfr.item(),
+            "acc": compute_accuracy(output, label)[0].item(),
+        }
+
+        if (self.batch_idx + 1) == self.num_batches:
+            self.update_lr()
+
+        return loss_summary
+
+    def parse_batch_train(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
+
+    def load_model(self, directory, epoch=None):
+        if not directory:
+            print("Note that load_model() is skipped as no pretrained model is given")
+            return
+
+        names = self.get_model_names()
+
+        # By default, the best model is loaded
+        model_file = "model-best.pth.tar"
+
+        if epoch is not None:
+            model_file = "model.pth.tar-" + str(epoch)
+
+        for name in names:
+            model_path = osp.join(directory, name, model_file)
+
+            if not osp.exists(model_path):
+                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
+
+            checkpoint = load_checkpoint(model_path)
+            state_dict = checkpoint["state_dict"]
+            epoch = checkpoint["epoch"]
+
+            # Ignore fixed token vectors
+            if "token_prefix" in state_dict:
+                del state_dict["token_prefix"]
+
+            if "token_suffix" in state_dict:
+                del state_dict["token_suffix"]
+
+            print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            # set strict=False
+            self._models[name].load_state_dict(state_dict, strict=False)
+
+    @torch.no_grad()
+    def test(self, split=None):
+        """A generic testing pipeline."""
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"  # in case val_loader is None
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set")
+
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output, *_ = self.model_inference(input)
+            if len(output) == 2:
+                output = output[0]
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results.values())[0]
+
+    @torch.no_grad()
+    def test_ood(self, data_loader, T):
+        """Test-time OOD detection pipeline."""
+        to_np = lambda x: x.data.cpu().numpy()
+        concat = lambda x: np.concatenate(x, axis=0)
+
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        glmcm_score = []
+        mcm_score = []
+        for batch_idx, (images, labels, *id_flag) in enumerate(tqdm(data_loader)):
+            images = images.cuda()
+            output, output_local, *_ = self.model_inference(images)
+            output /= 100.0
+            output_local /= 100.0
+            smax_global = to_np(F.softmax(output/T, dim=-1))
+            smax_local = to_np(F.softmax(output_local/T, dim=-1))
+            mcm_global_score = -np.max(smax_global, axis=1)
+            mcm_local_score = -np.max(smax_local, axis=(1, 2))
+            mcm_score.append(mcm_global_score)
+            glmcm_score.append(mcm_global_score+mcm_local_score)
+
+        return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(glmcm_score)[:len(data_loader.dataset)].copy()
+
+    @torch.no_grad()
+    def test_visualize(self, img_path, label):
+        """code for visualization results"""
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+ 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, preprocess = clip.load("ViT-B/16", device=device)
+
+        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
+        output, output_local, *_ = self.model_inference(image)
+        output=output.softmax(dim=-1)
+        max_index = torch.argmax(output, dim=1)
+        image_i=Image.open(img_path).convert('RGB')
+        # mask = torch.ones(1000, dtype=torch.bool, device=output_local.device)
+        # mask[0] = False  # 排除第 500 类
+
+        # # 选出除了第500类的所有特征：output_local[:,:,mask] => shape (B, D, 999)
+        # # 然后在 dim=2 求平均
+        # mean_except_500 = output_local[:, :, mask].mean(dim=2)  # shape (B, D)
+        # op=mean_except_500
+        op=output_local[:, :, 0]
+        print(op)
+        op=op/100.0
+        print(label)
+        op=(op-op.min())/(op.max()-op.min())
+
+        similarity_map=op
+        # 归一化热图到 0-1
+        similarity_map = similarity_map.view(14, 14)
+        # 假设 similarity_map 是形状为 (14, 14) 的torch张量
+        similarity_map = similarity_map.float()  # 确保是浮点类型
+
+        # 归一化到 [0, 1] 范围
+        similarity_map = (similarity_map - similarity_map.min()) / (
+            similarity_map.max() - similarity_map.min() + 1e-8
+        )  # 加1e-8避免除以0
+        # similarity_map=similarity_map**1.5
+        # 使用双线性插值放大到224x224
+        attention_map = F.interpolate(
+            similarity_map.unsqueeze(0).unsqueeze(0),  # 添加batch和channel维度 (1,1,14,14)
+            size=(224, 224),
+            mode="bilinear",
+            align_corners=False
+        ).squeeze(0).squeeze(0)  # 回到(224,224)
+
+        # 转换为numpy并准备热力图
+        attention_map_np = attention_map.cpu().numpy()
+        heatmap = np.uint8(255 * attention_map_np)  # 转换为0-255范围
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+        # 处理原始图像
+        image_np = np.array(image_i)  # 假设image_i是PIL图像
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)  # 转为BGR
+        image_np = cv2.resize(image_np, (224, 224))  # 确保尺寸匹配
+
+        # 叠加热力图和原图
+        superimposed_img = cv2.addWeighted(heatmap, 0.5, image_np, 0.5, 0)
+
+        # 保存结果
+        cv2.imwrite('/home/litianyu/projects/Mambo/output/viz/SCTCOCO/attention/attention_map.jpg', superimposed_img)
+
+        # input()
+
+
+        num_regions = output_local.shape[1]
+        label = torch.tensor(label).cuda()
+        label_repeat = label.repeat_interleave(num_regions)
+        print(output_local[:,:,0])
+        print(output_local[:,:,5])
+        output_local = F.softmax(output_local, dim=-1)
+        print(output_local[:,:,0])
+        print(output_local[:,:,5])
+        output_local = output_local.view(num_regions, -1)  # [num_regions, num_classes]
+        # -----top 200--------
+        pred_topk = torch.topk(output_local, k=200, dim=-1)[1]
+        contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(dim=1)
+        print(contains_label)
+        # input()
+        return contains_label
