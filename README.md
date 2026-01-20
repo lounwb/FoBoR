@@ -31,10 +31,10 @@ pip install -r requirements
 git clone https://github.com/KaiyangZhou/Dassl.pytorch.git && cd Dassl.pytorch/ && python setup.py develop
 ```
 ### Training
-You need to specify `top_k` and `eta` for Adaptive Background Suppression, and `lambda`, `n_class`, and `n_patch` for Confusable Foreground Rectification. You also need to add balanced weights `alpha` and `beta` for both modules.
+You need to specify `top_k` and `eta` for Adaptive Background Suppression, and `lambda`, `n_confuse_classes`, and `n_confuse_patches` for Confusable Foreground Rectification. You also need to add balanced weights `alpha` and `beta` for both modules.
 To train the model, use the `scripts/train.sh` script.
 ```bash
-bash scripts/train.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_class> <n_patch> <lambda_value> <top_k>
+bash scripts/train.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_confuse_classes> <n_confuse_patches> <lambda_value> <top_k>
 ```
 
 **Example:**
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=1 bash scripts/train.sh \
 To evaluate the model, use the `scripts/eval.sh` script.
 
 ```bash
-bash scripts/eval.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_class> <n_patch> <lambda_value> <top_k>
+bash scripts/eval.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_confuse_classes> <n_confuse_patches> <lambda_value> <top_k>
 ```
 
 **Example:**
