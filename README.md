@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=1 bash scripts/train.sh \
     imagenet \
     vit_b16_ep30 \
     end 16 16 False \
-    0.2 3.0 5.0 1 1 0.2 200
+    0.2 3.0 5.0 1 1 0.17 200
 ```
 
 ### Evaluation
@@ -58,11 +58,11 @@ bash scripts/eval.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <sho
 **Example:**
 ```bash
 CUDA_VISIBLE_DEVICES=1 bash scripts/eval.sh \
-    LoCoOp SCT Mambo \
+    LoCoOpCoCo SCTCoCo MamboCoCo \
     imagenet \
     vit_b16_ep30 \
     end 16 16 False \
-    0.2 3.0 5.0 1 1 0.2 200
+    0.2 3.0 5.0 1 1 0.17 200
 ```
 
 

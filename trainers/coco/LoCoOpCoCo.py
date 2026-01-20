@@ -24,7 +24,7 @@ def confusable_foreground_rectification_module(
     text_sim,
     label,
     true_probs=None,
-    lambda_value=0.83,
+    lambda_value=0.17,
     num_confuse_classes=1,
     num_confuse_patches=1,
     eps=1e-5,
@@ -54,7 +54,7 @@ def confusable_foreground_rectification_module(
 
     # 1. fusion similarity from textual modality and visual modality
     text_sim_for_each_sample = text_sim[label]  # [B, C]
-    fused = lambda_value * output + (1 - lambda_value) * text_sim_for_each_sample
+    fused =  (1 - lambda_value) * output + lambda_value * text_sim_for_each_sample
     fused[torch.arange(B), label] = float("-inf")
 
     _, topk_wrong_indices = torch.topk(
@@ -385,10 +385,10 @@ class LoCoOpCoCo(TrainerX):
         self.alpha_value = getattr(cfg, "alpha_value", 0.2)
         self.beta_value = getattr(cfg, "beta_value", 3.0)
         self.top_k = getattr(cfg, "top_k", 200)
-        self.num_classes = getattr(cfg, "num_classes", 1)
-        self.num_patches = getattr(cfg, "num_patches", 1)
+        self.num_confuse_classes = getattr(cfg, "num_confuse_classes", 1)
+        self.num_confuse_patches = getattr(cfg, "num_confuse_patches", 1)
         self.eta = getattr(cfg, "eta", 5.0)
-        self.lambda_value = getattr(cfg, "lambda_value", 0.83)
+        self.lambda_value = getattr(cfg, "lambda_value", 0.17)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -457,10 +457,9 @@ class LoCoOpCoCo(TrainerX):
                     label=label, 
                     lambda_value=self.lambda_value,
                     beta=self.beta_value,
-                    num_confuse_classes=self.num_classes,
-                    num_confuse_patches=self.num_patches,
+                    num_confuse_classes=self.num_confuse_classes,
+                    num_confuse_patches=self.num_confuse_patches,
                     true_probs=true_probs, 
-                    cfg=self.cfg
                 )
 
                 # calculate ABS loss
@@ -498,10 +497,9 @@ class LoCoOpCoCo(TrainerX):
                 text_sim=text_sim, 
                 label=label, 
                 lambda_value=self.lambda_value,
-                num_confuse_classes=self.num_classes,
-                num_confuse_patches=self.num_patches,
-                true_probs=true_probs, 
-                cfg=self.cfg
+                num_confuse_classes=self.num_confuse_classes,
+                num_confuse_patches=self.num_confuse_patches,
+                true_probs=true_probs,
             )
 
             # calculate ABS loss

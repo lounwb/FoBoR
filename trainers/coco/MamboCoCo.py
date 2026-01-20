@@ -66,7 +66,7 @@ def confusable_foreground_rectification_module(
     text_sim,
     label,
     true_probs=None,
-    lambda_value=0.83,
+    lambda_value=0.17,
     num_confuse_classes=1,
     num_confuse_patches=1,
     eps=1e-5,
@@ -96,7 +96,7 @@ def confusable_foreground_rectification_module(
 
     # 1. fusion similarity from textual modality and visual modality
     text_sim_for_each_sample = text_sim[label]  # [B, C]
-    fused = lambda_value * output + (1 - lambda_value) * text_sim_for_each_sample
+    fused =  (1 - lambda_value) * output + lambda_value * text_sim_for_each_sample
     fused[torch.arange(B), label] = float("-inf")
 
     _, topk_wrong_indices = torch.topk(
@@ -575,10 +575,10 @@ class MamboCoCo(TrainerX):
         self.alpha_value = getattr(cfg, "alpha_value", 0.2)
         self.beta_value = getattr(cfg, "beta_value", 3.0)
         self.top_k = getattr(cfg, "top_k", 200)
-        self.num_classes = getattr(cfg, "num_classes", 1)
-        self.num_patches = getattr(cfg, "num_patches", 1)
+        self.num_confuse_classes = getattr(cfg, "num_confuse_classes", 1)
+        self.num_confuse_patches = getattr(cfg, "num_confuse_patches", 1)
         self.eta = getattr(cfg, "eta", 5.0)
-        self.lambda_value = getattr(cfg, "lambda_value", 0.8)
+        self.lambda_value = getattr(cfg, "lambda_value", 0.17)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -642,10 +642,9 @@ class MamboCoCo(TrainerX):
                     text_sim=text_sim, 
                     label=label, 
                     lambda_value=self.lambda_value,
-                    num_confuse_classes=self.num_classes,
-                    num_confuse_patches=self.num_patches,
+                    num_confuse_classes=self.num_confuse_classes,
+                    num_confuse_patches=self.num_confuse_patches,
                     true_probs=true_probs, 
-                    cfg=self.cfg
                 )
 
                 batch_size, num_of_local_feature = (
@@ -655,10 +654,11 @@ class MamboCoCo(TrainerX):
                 output_local = output_local.view(batch_size * num_of_local_feature, -1)
                 # calculate ABS loss
                 loss_abs = adaptive_background_supression_module(
-                    p=output_local, 
-                    top_k=self.top_k, 
-                    label=label, 
-                    global_probs=probs, 
+                    background_local_sim=output_local_background, 
+                    label=label,
+                    class_local_sim=output_local,
+                    nat_probs=probs, 
+                    num_of_local_feature=num_of_local_feature,
                     attn_scores=attn_scores, 
                     eta=self.eta
                 )
@@ -671,7 +671,7 @@ class MamboCoCo(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            output, output_local, output_local_background, attn_scores, text_sim = (
+            output, output_local, output_local_background, text_sim, attn_scores = (
                 self.model(image)
             )
             # calculate CoOp loss
@@ -688,10 +688,9 @@ class MamboCoCo(TrainerX):
                 text_sim=text_sim, 
                 label=label, 
                 lambda_value=self.lambda_value,
-                num_confuse_classes=self.num_classes,
-                num_confuse_patches=self.num_patches,
+                num_confuse_classes=self.num_confuse_classes,
+                num_confuse_patches=self.num_confuse_patches,
                 true_probs=true_probs, 
-                cfg=self.cfg
             )
 
             batch_size, num_of_local_feature = (
@@ -701,10 +700,11 @@ class MamboCoCo(TrainerX):
             output_local = output_local.view(batch_size * num_of_local_feature, -1)
             # calculate ABS loss
             loss_abs = adaptive_background_supression_module(
-                p=output_local, 
-                top_k=self.top_k, 
-                label=label, 
-                global_probs=probs, 
+                background_local_sim=output_local_background, 
+                label=label,
+                class_local_sim=output_local,
+                nat_probs=probs, 
+                num_of_local_feature=num_of_local_feature,
                 attn_scores=attn_scores, 
                 eta=self.eta
             )

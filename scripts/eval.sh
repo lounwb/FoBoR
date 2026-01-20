@@ -44,7 +44,7 @@ do
         TRAINER_UPPER=$(echo $TRAINER_NAME | tr '[:lower:]' '[:upper:]')
         
         # Build output directory
-        DIR=output/${dataset}/${TRAINER}/${cfg}_${shots}shots/nctx${nctx}_csc${csc}_ctp${ctp}_alpha${alpha_value}_beta${beta_value}_eta${eta_value}_nclass${n_class}_npatch${n_patch}_lambda${lambda_value}_topk${top_k}/seed${SEED}
+        DIR=output/${dataset}/${TRAINER}/${cfg}_${shots}shots/nctx${nctx}_csc${csc}_ctp${ctp}/alpha${alpha_value}_beta${beta_value}_eta${eta_value}_nclass${n_class}_npatch${n_patch}_lambda${lambda_value}_topk${top_k}/seed${SEED}
         
         echo "📌 Evaluating model in: $DIR"
         # Execute evaluation script

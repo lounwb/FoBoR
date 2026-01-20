@@ -41,8 +41,9 @@ def reset_cfg(cfg, args):
         "trainer": "TRAINER.NAME",
         "backbone": "MODEL.BACKBONE.NAME",
         "head": "MODEL.HEAD.NAME",
-        "alpha_value": "lambda_value",
+        "alpha_value": "alpha_value",
         "beta_value": "beta_value",
+        "lambda_value": "lambda_value",
         "top_k": "top_k",
         "num_classes": "num_classes",
         "num_patches": "num_patches",
@@ -80,8 +81,9 @@ def extend_cfg(cfg):
         C.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
 
         cfg.TRAINER[args.trainer.upper()] = C
-
-    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+        cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    else:
+        raise ValueError("Trainer {} not recognized, support List: ['LoCoOp', 'SCT', 'Mambo', 'LoCoOpCoCo', 'SCTCoCo', 'MamboCoCo']".format(args.trainer))
 
 
 def setup_cfg(args):
@@ -178,10 +180,13 @@ if __name__ == "__main__":
     )
     # params for CoCo
     parser.add_argument(
-        "--alpha_value", type=float, default=0.2, help="weight for abs loss"
+        "--alpha_value", type=float, default=0.2, help="default weight for abs loss"
     )
     parser.add_argument(
-        "--beta_value", type=float, default=3.0, help="weight for cfr loss"
+        "--beta_value", type=float, default=3.0, help="default weight for cfr loss"
+    )
+    parser.add_argument(
+        "--lambda_value", type=float, default=0.17, help="default weight for balancing textual modality similarity & visual modality similarity"
     )
     parser.add_argument(
         "--top_k",
@@ -190,13 +195,13 @@ if __name__ == "__main__":
         help="top k strategy for decomposing foreground and background patches in LoCoOp",
     )
     parser.add_argument(
-        "--num_classes",
+        "--num_confuse_classes",
         type=int,
         default=1,
         help="number for selecting confusable classes",
     )
     parser.add_argument(
-        "--num_patches",
+        "--num_confuse_patches",
         type=int,
         default=1,
         help="number of confuable foreground patches",

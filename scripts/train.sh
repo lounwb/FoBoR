@@ -4,23 +4,24 @@
 # Example: CUDA_VISIBLE_DEVICES=1 bash train.sh LoCoOp SCT Mambo 0.2 0.15
 
 # Basic configuration
-ROOT="[YOUR_DATASET_PATH]"
-SEEDS=(1 2 3)  # List of random seeds
+ROOT="/home/litianyu/data"
+# SEEDS=(1 2 3)  # List of random seeds
+SEEDS=(1)  # List of random seeds
 
 # ===================== Core Modification: Argument Parsing =====================
 # Validate argument count (At least 1 trainer + 13 parameters)
 if [ $# -lt 14 ]; then
     echo "❌ Insufficient parameters!"
-    echo "✅ Correct usage: $0 <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_class> <n_patch> <lambda_value> <top_k>"
+    echo "✅ Correct usage: $0 <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <shots> <csc> <alpha_value> <beta_value> <eta_value> <n_confuse_class> <n_confuse_patch> <lambda_value> <top_k>"
     exit 1
 fi
 
 # params for FoBoR
 top_k=${@: -1}
 lambda_value=${@: -2:1}
-n_patch=${@: -3:1}
-n_class=${@: -4:1}
-eta_value=${@: -5:1}
+n_confuse_patch=${@: -3:1}
+n_confuse_class=${@: -4:1}
+eta=${@: -5:1}
 beta_value=${@: -6:1}
 alpha_value=${@: -7:1}
 # base params
@@ -34,6 +35,7 @@ dataset=${@: -13:1}
 TRAINERS=("${@:1: $#-13}")
 # ============================================================
 
+echo "📌 Current working directory: $PWD"
 # Extract epoch number from CFG string
 epoch=$(echo $cfg | grep -oE '[0-9]+' | tail -1)
 
@@ -46,12 +48,11 @@ do
         TRAINER_UPPER=$(echo $TRAINER_NAME | tr '[:lower:]' '[:upper:]')
         
         # Build output directory
-        DIR=output/${dataset}/${TRAINER}/${cfg}_${shots}shots/nctx${nctx}_csc${csc}_ctp${ctp}_alpha${alpha_value}_beta${beta_value}_eta${eta_value}_nclass${n_class}_npatch${n_patch}_lambda${lambda_value}_topk${top_k}/seed${SEED}
+        DIR=output/${dataset}/${TRAINER}/${cfg}_${shots}shots/nctx${nctx}_csc${csc}_ctp${ctp}/alpha${alpha_value}_beta${beta_value}_eta${eta}_nclass${n_confuse_class}_npatch${n_confuse_patch}_lambda${lambda_value}_topk${top_k}/seed${SEED}
 
         if [ -d "$DIR" ]; then
             echo "⚠️ Results already exist: ${DIR} (Skipping this task)"
         else
-            echo "📌 Current working directory: $PWD"
             # Execute training script
             python train.py \
                 --root ${ROOT} \
@@ -61,14 +62,14 @@ do
                 --config-file configs/trainers/${TRAINER}/${cfg}.yaml \
                 --output-dir ${DIR} \
                 --lambda_value ${lambda_value} \
-                --topk ${top_k} \
+                --top_k ${top_k} \
                 --model-dir ${DIR} \
                 --load-epoch ${epoch} \
                 --alpha_value ${alpha_value} \
                 --beta_value ${beta_value} \
-                --eta_value ${eta_value} \
-                --num_classes ${n_class} \
-                --num_patches ${n_patch} \
+                --eta ${eta} \
+                --num_confuse_classes ${n_confuse_class} \
+                --num_confuse_patches ${n_confuse_patch} \
                 DATASET.NUM_SHOTS ${shots} \
                 TRAINER.${TRAINER_UPPER}.N_CTX ${nctx} \
                 TRAINER.${TRAINER_UPPER}.CSC ${csc} \
