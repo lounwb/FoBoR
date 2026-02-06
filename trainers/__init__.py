@@ -3,15 +3,15 @@ from .sct import SCT
 from .mambo import Mambo
 
 
-from .coco import LoCoOpCoCo, SCTCoCo, MamboCoCo
+from .fobor import LoCoOpFoBoR, SCTFoBoR, MamboFoBoR
 
 __all__ = [
     # Foreground-background decomposition methods
     "LoCoOp",
     "SCT",
     "Mambo",
-    # + CoCo
-    "LoCoOpCoCo",
-    "SCTCoCo",
-    "MamboCoCo",
+    # + FoBoR
+    "LoCoOpFoBoR",
+    "SCTFoBoR",
+    "MamboFoBoR",
 ]

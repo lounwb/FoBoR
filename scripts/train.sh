@@ -4,7 +4,7 @@
 # Example: CUDA_VISIBLE_DEVICES=1 bash train.sh LoCoOp SCT Mambo 0.2 0.15
 
 # Basic configuration
-ROOT="/home/litianyu/data"
+ROOT="[YOUR_DATASET_PATH]"
 # SEEDS=(1 2 3)  # List of random seeds
 SEEDS=(1)  # List of random seeds
 

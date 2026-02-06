@@ -32,7 +32,7 @@ bash scripts/train.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <sh
 **Example:**
 ```bash
 CUDA_VISIBLE_DEVICES=1 bash scripts/train.sh \
-    LoCoOpCoCo SCTCoCo MamboCoCo \
+    LoCoOpFoBoR SCTFoBoR MamboFoBoR \
     imagenet \
     vit_b16_ep30 \
     end 16 16 False \
@@ -50,7 +50,7 @@ bash scripts/eval.sh <trainer1> [trainer2 ...] <dataset> <cfg> <ctp> <nctx> <sho
 **Example:**
 ```bash
 CUDA_VISIBLE_DEVICES=1 bash scripts/eval.sh \
-    LoCoOpCoCo SCTCoCo MamboCoCo \
+    LoCoOpFoBoR SCTFoBoR MamboFoBoR \
     imagenet \
     vit_b16_ep30 \
     end 16 16 False \

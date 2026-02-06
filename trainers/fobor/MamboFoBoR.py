@@ -1,21 +1,63 @@
 import os.path as osp
 
-import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+from torch.cuda.amp import GradScaler, autocast
+
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
-from dassl.optim import build_lr_scheduler, build_optimizer
-from dassl.utils import load_checkpoint, load_pretrained_weights
-from torch.cuda.amp import GradScaler, autocast
-from torch.nn import functional as F
-from tqdm import tqdm
+from dassl.utils import load_pretrained_weights, load_checkpoint
+from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip_w_local import clip
 from clip_w_local.simple_tokenizer import SimpleTokenizer as _Tokenizer
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
 
 _tokenizer = _Tokenizer()
 softmax = nn.Softmax(dim=1).cuda()
+
+
+def softmax_with_background(z, b):
+    numerator = torch.exp(z)
+    sum_exp = torch.sum(numerator, dim=1)
+    denominator = sum_exp + b
+    denominator = denominator.unsqueeze(1)
+    result = numerator / denominator
+
+    return result
+
+
+def weighted_background_mask_avg(tensor, weight, eps=1e-8):
+    weight = weight.unsqueeze(dim=1)
+    x = tensor
+    x_mean = x.mean(dim=1, keepdim=True)
+    x_std = x.std(dim=1, keepdim=True)
+    threshold = x_mean - 1 * weight * x_std
+    mask = x > threshold
+    return mask
+
+
+def filter_feature_map(background, output_local):
+    background = background.squeeze(dim=2)
+    sums_result = torch.zeros((background.shape[0], 1))
+    mean_result = torch.zeros((background.shape[0], 1))
+    for i in range(background.shape[0]):
+        bgob = background[i]
+        sim_local = output_local[i]
+        bb_bg = bgob
+        local = sim_local
+        kekka_2 = softmax_with_background(local, bb_bg)
+        if kekka_2.shape[0] > 0:
+            topk_values = torch.topk(kekka_2.flatten(), k=10).values
+            mean_topk_1 = topk_values.mean()
+            means_1 = mean_topk_1
+            sums_result[i] = means_1
+        else:
+            sums_result[i] = 0
+    return sums_result.squeeze()
 
 
 def confusable_foreground_rectification_module(
@@ -107,60 +149,67 @@ def confusable_foreground_rectification_module(
 
 
 def adaptive_background_supression_module(
-    p: torch.Tensor,  # shape: (B, P, C)
-    top_k: torch.Tensor,  # shape: (B,)
-    label: torch.Tensor,  # shape: (B,)
-    global_probs: torch.Tensor,  # global probs, shape: (B, n_cls)
-    attn_scores: torch.Tensor = None,  # shape: (B, P)
-    eta: int = 5.0,
+    background_local_sim,
+    label,
+    class_local_sim,
+    nat_probs,
+    num_of_local_feature,
+    attn_scores,
+    eta=5.0,
 ):
-    """
-    Extract non-Top-K regions and calculate entropy.
-    """
-    B, P, C = p.shape
-
-    p = p.view(B * P, -1)  # shape: (B * P, n_cls)
-
-    device = p.device
-    # attn_scores min-max normalize (per sample)
+    # normalize attn_scores
     attn_min = attn_scores.min(dim=1, keepdim=True)[0]
     attn_max = attn_scores.max(dim=1, keepdim=True)[0]
     attn_scores = (attn_scores - attn_min) / (attn_max - attn_min + 1e-8)
+    attn_scores = attn_scores.reshape(-1)
+    true_probs = torch.gather(nat_probs, 1, (label.unsqueeze(1)).long()).squeeze()
+    true_probs_repeat = true_probs.repeat_interleave(num_of_local_feature)
+    label_repeat = label.repeat_interleave(background_local_sim.shape[1]).cuda()
+    background_local_sim /= 100.0
+    class_local_p = class_local_sim.gather(1, label_repeat.unsqueeze(1)).squeeze(1)
+    class_local_p /= 100.0
+    class_local_p = (class_local_p - class_local_p.min()) / (
+        class_local_p.max() - class_local_p.min()
+    )
+    batch_size, num_of_local_feature = (
+        background_local_sim.shape[0],
+        background_local_sim.shape[1],
+    )
+    class_local_tp = F.softmax(class_local_sim, dim=-1)
+    background_local_sim = background_local_sim.squeeze(dim=2)
+    background_local_sim = background_local_sim.view(batch_size * num_of_local_feature)
+    background_local_sim = background_local_sim * (
+        1 - true_probs_repeat
+    ) + true_probs_repeat * background_local_sim * (1 - class_local_p)
+    background_local_sim = background_local_sim.view(batch_size, num_of_local_feature)
+    binary_tensor = weighted_background_mask_avg(
+        background_local_sim, 2 * true_probs - 1
+    )
+    binary_tensor = binary_tensor.view(
+        background_local_sim.shape[0] * background_local_sim.shape[1], 1
+    )
+    background_local_sim = background_local_sim.view(
+        background_local_sim.shape[0] * background_local_sim.shape[1], 1
+    )
+    binary_tensor = binary_tensor.squeeze()
 
-    attn_scores = attn_scores.reshape(-1)  # shape: (B * P,)
-    # 1. compute local sim & global sim and broadcast
-    p = F.softmax(p, dim=-1)  # shape: (B * P, n_cls), local sim
-    true_probs = torch.gather(
-        global_probs, 1, (label.unsqueeze(1)).long()
-    ).squeeze()  # shape: (B,), global sim
-    true_probs_repeat = true_probs.repeat_interleave(P)  # shape: (B * P,)
-    label_repeat = label.repeat_interleave(P).to(device)  # shape: (B * P, )
+    label_idx = label_repeat.unsqueeze(1).long()  # shape: (B*P, 1)
+    # class_local_gt = torch.gather(class_local_tp, 1, label_idx).squeeze(1)  # shape: (B*P,)
+    # selected_local_gt = class_local_gt[binary_tensor]
+    selected_p = class_local_tp[binary_tensor]
+    selected_true_probs = true_probs_repeat[binary_tensor]
+    selected_attn_scores = attn_scores[binary_tensor]
 
-    # 2. get non-Top-K regions
-    _, pred_topk = torch.topk(p, k=top_k, dim=1)  # shape: (B*P, top_k)
-    # label_idx = label_repeat.unsqueeze(1).long()  # shape: (B*P, 1)
-
-    contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(
-        dim=1
-    )  # shape: (B*P, )
-
-    # 3. select non-Top-K regions
-    selected_p = p[~contains_label]  # shape: (N, n_cls)
-    selected_true_probs = true_probs_repeat.to(device)[~contains_label]  # shape: (N,)
-    selected_attn_scores = attn_scores[~contains_label]  # shape: (N,)
-
-    # if no selected regions, return zero on correct device
-    if selected_p.shape[0] == 0:
-        return torch.tensor(0.0).to(device)
-
-    # 4. compute weights for selected regions
-    weights_before = selected_true_probs * selected_attn_scores
-    weights = torch.sigmoid(eta * weights_before)
+    weights_befores = selected_true_probs * selected_attn_scores
+    weights = torch.sigmoid(eta * weights_befores)
     weights = weights.unsqueeze(dim=1)  # shape: (N, 1)
+    if selected_p.shape[0] == 0:
+        return torch.tensor([0]).cuda()
 
-    loss = torch.sum(weights * selected_p * torch.log(selected_p + 1e-5), dim=1)
-
-    return torch.mean(loss)
+    return torch.mean(
+        torch.sum(weights * selected_p * torch.log(selected_p + 1e-5), 1)
+        * (0.0000001 + selected_true_probs)
+    )
 
 
 def load_clip_to_cpu(cfg):
@@ -211,8 +260,8 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.LOCOOPCOCO.N_CTX
-        ctx_init = cfg.TRAINER.LOCOOPCOCO.CTX_INIT
+        n_ctx = cfg.TRAINER.MAMBOFOBOR.N_CTX
+        ctx_init = cfg.TRAINER.MAMBOFOBOR.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
@@ -233,7 +282,7 @@ class PromptLearner(nn.Module):
 
         else:
             # random initialization
-            if cfg.TRAINER.LOCOOPCOCO.CSC:
+            if cfg.TRAINER.MAMBOFOBOR.CSC:
                 print("Initializing class-specific contexts")
                 ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
             else:
@@ -250,7 +299,6 @@ class PromptLearner(nn.Module):
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
@@ -265,7 +313,7 @@ class PromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
-        self.class_token_position = cfg.TRAINER.LOCOOPCOCO.CLASS_TOKEN_POSITION
+        self.class_token_position = cfg.TRAINER.MAMBOFOBOR.CLASS_TOKEN_POSITION
 
     def forward(self):
         ctx = self.ctx
@@ -334,10 +382,142 @@ class PromptLearner(nn.Module):
         return prompts
 
 
+class Background_PromptLearner(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        n_cls = 1
+        n_ctx = cfg.TRAINER.MAMBOFOBOR.N_CTX
+        n_ctx = 64
+        ctx_init = cfg.TRAINER.MAMBOFOBOR.CTX_INIT
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        clip_imsize = clip_model.visual.input_resolution
+        cfg_imsize = cfg.INPUT.SIZE[0]
+        assert cfg_imsize == clip_imsize, (
+            f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        )
+
+        if ctx_init:
+            # use given words to initialize context vectors
+            ctx_init = ctx_init.replace("_", " ")
+            n_ctx = len(ctx_init.split(" "))
+            prompt = clip.tokenize(ctx_init)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = ctx_init
+
+        else:
+            # random initialization
+            if cfg.TRAINER.MAMBOFOBOR.CSC:
+                print("Initializing class-specific contexts")
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+            else:
+                print("Initializing a generic context")
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+
+        classnames = [name.replace("_", " ") for name in classnames]
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        prompts = [prompt_prefix + name for name in classnames]
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.name_lens = name_lens
+        self.class_token_position = cfg.TRAINER.MAMBOFOBOR.CLASS_TOKEN_POSITION
+
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(1, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        if self.class_token_position == "end":
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,  # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+
+        elif self.class_token_position == "middle":
+            half_n_ctx = self.n_ctx // 2
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
+                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        ctx_i_half1,  # (1, n_ctx//2, dim)
+                        class_i,  # (1, name_len, dim)
+                        ctx_i_half2,  # (1, n_ctx//2, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        elif self.class_token_position == "front":
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i = ctx[i : i + 1, :, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        class_i,  # (1, name_len, dim)
+                        ctx_i,  # (1, n_ctx, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        else:
+            raise ValueError
+
+        return prompts
+
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.background_prompt_learner = Background_PromptLearner(
+            cfg, ["."], clip_model
+        )
+        self.tokenized_background_prompts = (
+            self.background_prompt_learner.tokenized_prompts
+        )
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -349,39 +529,48 @@ class CustomCLIP(nn.Module):
             image.type(self.dtype), attn=True
         )
 
-        prompts = self.prompt_learner()
+        background_prompt = self.background_prompt_learner()
+        class_prompts = self.prompt_learner()
         tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-
+        tokenized_background_prompts = self.tokenized_background_prompts
+        class_features = self.text_encoder(class_prompts, tokenized_prompts)
+        background_feature = self.text_encoder(
+            background_prompt, tokenized_background_prompts
+        )
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         local_image_features = local_image_features / local_image_features.norm(
             dim=-1, keepdim=True
         )
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
+        class_features = class_features / class_features.norm(dim=-1, keepdim=True)
+        background_feature = background_feature / background_feature.norm(
+            dim=-1, keepdim=True
+        )
         logit_scale = self.logit_scale.exp()
+        global_class_sim = logit_scale * image_features @ class_features.t()
+        local_class_sim = logit_scale * local_image_features @ class_features.T
+        local_background_sim = logit_scale * local_image_features @ background_feature.T
+        text_sim = logit_scale * class_features @ class_features.t()
 
-        text_sim = (
-            logit_scale * text_features @ text_features.t()
-        )  # [num_classes, num_classes]
-        logits = logit_scale * image_features @ text_features.t()
-        logits_local = logit_scale * local_image_features @ text_features.T
-
-        return logits, logits_local, text_sim, attn_scores
+        return (
+            global_class_sim,
+            local_class_sim,
+            local_background_sim,
+            text_sim,
+            attn_scores,
+        )
 
 
 @TRAINER_REGISTRY.register()
-class LoCoOpCoCo(TrainerX):
-    """Local regularized Context Optimization (LOCOOPCOCO)."""
+class MamboFoBoR(TrainerX):
+    """Local regularized Context Optimization (Mambo)."""
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.LOCOOPCOCO.PREC in ["fp16", "fp32", "amp"]
-
+        assert cfg.TRAINER.MAMBOFOBOR.PREC in ["fp16", "fp32", "amp"]
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
-        # Hyperparameters for CoCo
+        # Hyperparameters for FoBoR
         self.alpha_value = getattr(cfg, "alpha_value", 0.2)
         self.beta_value = getattr(cfg, "beta_value", 3.0)
         self.top_k = getattr(cfg, "top_k", 200)
@@ -393,23 +582,18 @@ class LoCoOpCoCo(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if (
-            cfg.TRAINER.LOCOOPCOCO.PREC == "fp32"
-            or cfg.TRAINER.LOCOOPCOCO.PREC == "amp"
-        ):
+        if cfg.TRAINER.MAMBOFOBOR.PREC == "fp32" or cfg.TRAINER.MAMBOFOBOR.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
+
         for param in self.model.parameters():
             param.requires_grad_(False)
-        print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "prompt_learner" in name:
+            if "prompt_learner" in name or "background_prompt_learner" in name:
                 param.requires_grad_(True)
-
-        # or "semantic_adapter" in name or "background_adapter" in name or "measure" in name or "alignment"
 
         print("Unfrozen parameters:")
         for name, param in self.model.named_parameters():
@@ -424,7 +608,7 @@ class LoCoOpCoCo(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("model", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.LOCOOPCOCO.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.MAMBOFOBOR.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -436,19 +620,20 @@ class LoCoOpCoCo(TrainerX):
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
 
-        prec = self.cfg.TRAINER.LOCOOPCOCO.PREC
+        prec = self.cfg.TRAINER.MAMBOFOBOR.PREC
 
         if prec == "amp":
             with autocast():
-                output, output_local, text_sim, attn_scores = self.model(image)
-                # label_onehot = F.one_hot(label, num_classes=self.num_classes)
+                output, output_local, output_local_background, text_sim, attn_scores = (
+                    self.model(image)
+                )
+                # calculate CoOp loss
+                label_onehot = F.one_hot(label, num_classes=self.num_classes)
                 probs = F.softmax(output, dim=1)
-                true_probs = torch.gather(
-                    probs, 1, (label.unsqueeze(1)).long()
-                ).squeeze()
-                # calculate cross entropt loss
-                loss_id = F.cross_entropy(output, label)
-
+                true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
+                # loss = -torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
+                loss = -torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1)
+                loss_id = loss.mean()
                 # calculate CFR loss
                 loss_cfr = confusable_foreground_rectification_module(
                     output=output, 
@@ -456,40 +641,45 @@ class LoCoOpCoCo(TrainerX):
                     text_sim=text_sim, 
                     label=label, 
                     lambda_value=self.lambda_value,
-                    beta=self.beta_value,
                     num_confuse_classes=self.num_confuse_classes,
                     num_confuse_patches=self.num_confuse_patches,
                     true_probs=true_probs, 
                 )
 
+                batch_size, num_of_local_feature = (
+                    output_local.shape[0],
+                    output_local.shape[1],
+                )
+                output_local = output_local.view(batch_size * num_of_local_feature, -1)
                 # calculate ABS loss
                 loss_abs = adaptive_background_supression_module(
-                    p=output_local, 
-                    top_k=self.top_k, 
-                    label=label, 
-                    global_probs=probs, 
+                    background_local_sim=output_local_background, 
+                    label=label,
+                    class_local_sim=output_local,
+                    nat_probs=probs, 
+                    num_of_local_feature=num_of_local_feature,
                     attn_scores=attn_scores, 
                     eta=self.eta
                 )
 
-                # # calculate total loss for LOCOOPCOCO
-                loss = (
-                    loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
-                )
+                # calculate total loss for MAMBOFOBOR
+                loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
 
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            output, output_local, text_sim, attn_scores = self.model(image)
-
-            # label_onehot = F.one_hot(label, num_classes=self.num_classes)
+            output, output_local, output_local_background, text_sim, attn_scores = (
+                self.model(image)
+            )
+            # calculate CoOp loss
+            label_onehot = F.one_hot(label, num_classes=self.num_classes)
             probs = F.softmax(output, dim=1)
             true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
-            # calculate cross entropt loss
-            loss_id = F.cross_entropy(output, label)
-
+            # loss = -torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
+            loss = -torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1)
+            loss_id = loss.mean()
             # calculate CFR loss
             loss_cfr = confusable_foreground_rectification_module(
                 output=output, 
@@ -499,21 +689,28 @@ class LoCoOpCoCo(TrainerX):
                 lambda_value=self.lambda_value,
                 num_confuse_classes=self.num_confuse_classes,
                 num_confuse_patches=self.num_confuse_patches,
-                true_probs=true_probs,
+                true_probs=true_probs, 
             )
 
+            batch_size, num_of_local_feature = (
+                output_local.shape[0],
+                output_local.shape[1],
+            )
+            output_local = output_local.view(batch_size * num_of_local_feature, -1)
             # calculate ABS loss
             loss_abs = adaptive_background_supression_module(
-                p=output_local, 
-                top_k=self.top_k, 
-                label=label, 
-                global_probs=probs, 
+                background_local_sim=output_local_background, 
+                label=label,
+                class_local_sim=output_local,
+                nat_probs=probs, 
+                num_of_local_feature=num_of_local_feature,
                 attn_scores=attn_scores, 
                 eta=self.eta
             )
 
-            # # calculate total loss for LOCOOPCOCO
+            # calculate total loss for MAMBOFOBOR
             loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
+
             self.model_backward_and_update(loss)
 
         loss_summary = {
@@ -611,24 +808,57 @@ class LoCoOpCoCo(TrainerX):
         """Test-time OOD detection pipeline."""
         to_np = lambda x: x.data.cpu().numpy()
         concat = lambda x: np.concatenate(x, axis=0)
-
         self.set_model_mode("eval")
         self.evaluator.reset()
 
-        glmcm_score = []
+        rmcm_score = []
         mcm_score = []
         for batch_idx, (images, labels, *id_flag) in enumerate(tqdm(data_loader)):
             images = images.cuda()
-            output, output_local, *_ = self.model_inference(images)
+            output, output_local, output_local_background, *_ = self.model_inference(
+                images
+            )
             output /= 100.0
             output_local /= 100.0
+            output_local_background /= 100.0
             smax_global = to_np(F.softmax(output / T, dim=-1))
             smax_local = to_np(F.softmax(output_local / T, dim=-1))
+            p = F.softmax(output / T, dim=-1)
+            p, _ = torch.max(p, dim=-1, keepdim=True)
+            sum_bg = filter_feature_map(output_local_background, output_local)
+            sum_bg = to_np(sum_bg)
             mcm_global_score = -np.max(smax_global, axis=1)
             mcm_local_score = -np.max(smax_local, axis=(1, 2))
-            mcm_score.append(mcm_global_score)
-            glmcm_score.append(mcm_global_score + mcm_local_score)
+            sum_score = -sum_bg
+            mcm_score.append(mcm_global_score + mcm_local_score)
+            rmcm_score.append(mcm_global_score + sum_score)
+        return concat(mcm_score)[: len(data_loader.dataset)].copy(), concat(rmcm_score)[
+            : len(data_loader.dataset)
+        ].copy()
 
-        return concat(mcm_score)[: len(data_loader.dataset)].copy(), concat(
-            glmcm_score
-        )[: len(data_loader.dataset)].copy()
+    @torch.no_grad()
+    def test_visualize(self, img_path, label):
+        """code for visualization results"""
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, preprocess = clip.load("ViT-B/16", device=device)
+
+        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
+        output, output_local, *_ = self.model_inference(image)
+
+        num_regions = output_local.shape[1]
+        label = torch.tensor(label).cuda()
+        label_repeat = label.repeat_interleave(num_regions)
+        output_local = F.softmax(output_local, dim=-1)
+
+        output_local = output_local.view(num_regions, -1)
+
+        # -----top 200--------
+        pred_topk = torch.topk(output_local, k=200, dim=1)[1]
+        contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(
+            dim=1
+        )
+
+        return contains_label

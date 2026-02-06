@@ -1,27 +1,21 @@
 import os.path as osp
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from torch.cuda.amp import GradScaler, autocast
-
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
-from dassl.utils import load_pretrained_weights, load_checkpoint
-from dassl.optim import build_optimizer, build_lr_scheduler
+from dassl.optim import build_lr_scheduler, build_optimizer
+from dassl.utils import load_checkpoint, load_pretrained_weights
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn import functional as F
+from tqdm import tqdm
 
 from clip_w_local import clip
 from clip_w_local.simple_tokenizer import SimpleTokenizer as _Tokenizer
-import numpy as np
-from tqdm import tqdm
-from PIL import Image
-import cv2
-
-
 
 _tokenizer = _Tokenizer()
 softmax = nn.Softmax(dim=1).cuda()
-
 
 
 def confusable_foreground_rectification_module(
@@ -111,6 +105,7 @@ def confusable_foreground_rectification_module(
 
     return loss_confuse
 
+
 def adaptive_background_supression_module(
     p: torch.Tensor,  # shape: (B, P, C)
     top_k: torch.Tensor,  # shape: (B,)
@@ -160,12 +155,10 @@ def adaptive_background_supression_module(
 
     # 4. compute weights for selected regions
     weights_before = selected_true_probs * selected_attn_scores
-    # Optional: z-score normalize
-    # weights_before = (weights_before - weights_before.mean()) / (weights_before.std() + 1e-8)
     weights = torch.sigmoid(eta * weights_before)
     weights = weights.unsqueeze(dim=1)  # shape: (N, 1)
 
-    loss = torch.sum(weights * selected_p * torch.log(selected_p + 1e-5), dim=1) * (0.0000001 + selected_true_probs) 
+    loss = torch.sum(weights * selected_p * torch.log(selected_p + 1e-5), dim=1)
 
     return torch.mean(loss)
 
@@ -206,7 +199,10 @@ class TextEncoder(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        x = (
+            x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+            @ self.text_projection
+        )
 
         return x
 
@@ -215,13 +211,15 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.SCTCOCO.N_CTX
-        ctx_init = cfg.TRAINER.SCTCOCO.CTX_INIT
+        n_ctx = cfg.TRAINER.LOCOOPFOBOR.N_CTX
+        ctx_init = cfg.TRAINER.LOCOOPFOBOR.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        assert cfg_imsize == clip_imsize, (
+            f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        )
 
         if ctx_init:
             # use given words to initialize context vectors
@@ -235,7 +233,7 @@ class PromptLearner(nn.Module):
 
         else:
             # random initialization
-            if cfg.TRAINER.SCTCOCO.CSC:
+            if cfg.TRAINER.LOCOOPFOBOR.CSC:
                 print("Initializing class-specific contexts")
                 ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
             else:
@@ -267,7 +265,7 @@ class PromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
-        self.class_token_position = cfg.TRAINER.SCTCOCO.CLASS_TOKEN_POSITION
+        self.class_token_position = cfg.TRAINER.LOCOOPFOBOR.CLASS_TOKEN_POSITION
 
     def forward(self):
         ctx = self.ctx
@@ -281,7 +279,7 @@ class PromptLearner(nn.Module):
             prompts = torch.cat(
                 [
                     prefix,  # (n_cls, 1, dim)
-                    ctx,     # (n_cls, n_ctx, dim)
+                    ctx,  # (n_cls, n_ctx, dim)
                     suffix,  # (n_cls, *, dim)
                 ],
                 dim=1,
@@ -299,11 +297,11 @@ class PromptLearner(nn.Module):
                 ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
                 prompt = torch.cat(
                     [
-                        prefix_i,     # (1, 1, dim)
+                        prefix_i,  # (1, 1, dim)
                         ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,      # (1, name_len, dim)
+                        class_i,  # (1, name_len, dim)
                         ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,     # (1, *, dim)
+                        suffix_i,  # (1, *, dim)
                     ],
                     dim=1,
                 )
@@ -321,8 +319,8 @@ class PromptLearner(nn.Module):
                 prompt = torch.cat(
                     [
                         prefix_i,  # (1, 1, dim)
-                        class_i,   # (1, name_len, dim)
-                        ctx_i,     # (1, n_ctx, dim)
+                        class_i,  # (1, name_len, dim)
+                        ctx_i,  # (1, n_ctx, dim)
                         suffix_i,  # (1, *, dim)
                     ],
                     dim=1,
@@ -348,21 +346,24 @@ class CustomCLIP(nn.Module):
 
     def forward(self, image):
         image_features, local_image_features, attn_scores = self.image_encoder(
-            image.type(self.dtype),
-            attn=True
+            image.type(self.dtype), attn=True
         )
 
         prompts = self.prompt_learner()
         tokenized_prompts = self.tokenized_prompts
-
         text_features = self.text_encoder(prompts, tokenized_prompts)
+
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
+        local_image_features = local_image_features / local_image_features.norm(
+            dim=-1, keepdim=True
+        )
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         logit_scale = self.logit_scale.exp()
 
-        text_sim = logit_scale * text_features @ text_features.t()   # [num_classes, num_classes]
+        text_sim = (
+            logit_scale * text_features @ text_features.t()
+        )  # [num_classes, num_classes]
         logits = logit_scale * image_features @ text_features.t()
         logits_local = logit_scale * local_image_features @ text_features.T
 
@@ -370,18 +371,16 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class SCTCoCo(TrainerX):
-    """Local regularized Context Optimization (SCTCOCO).
-    """
+class LoCoOpFoBoR(TrainerX):
+    """Local regularized Context Optimization (LOCOOPFOBOR)."""
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.SCTCOCO.PREC in ["fp16", "fp32", "amp"]
-
+        assert cfg.TRAINER.LOCOOPFOBOR.PREC in ["fp16", "fp32", "amp"]
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
-        # Hyperparameters for CoCo
+        # Hyperparameters for FoBoR
         self.alpha_value = getattr(cfg, "alpha_value", 0.2)
         self.beta_value = getattr(cfg, "beta_value", 3.0)
         self.top_k = getattr(cfg, "top_k", 200)
@@ -393,7 +392,10 @@ class SCTCoCo(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.SCTCOCO.PREC == "fp32" or cfg.TRAINER.SCTCOCO.PREC == "amp":
+        if (
+            cfg.TRAINER.LOCOOPFOBOR.PREC == "fp32"
+            or cfg.TRAINER.LOCOOPFOBOR.PREC == "amp"
+        ):
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -403,7 +405,7 @@ class SCTCoCo(TrainerX):
             param.requires_grad_(False)
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "prompt_learner" in name: 
+            if "prompt_learner" in name:
                 param.requires_grad_(True)
 
         # or "semantic_adapter" in name or "background_adapter" in name or "measure" in name or "alignment"
@@ -421,7 +423,7 @@ class SCTCoCo(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("model", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.SCTCOCO.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.LOCOOPFOBOR.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -433,19 +435,19 @@ class SCTCoCo(TrainerX):
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
 
-        prec = self.cfg.TRAINER.SCTCOCO.PREC
+        prec = self.cfg.TRAINER.LOCOOPFOBOR.PREC
 
         if prec == "amp":
             with autocast():
                 output, output_local, text_sim, attn_scores = self.model(image)
-
-                label_onehot = F.one_hot(label, num_classes=self.num_classes)
+                # label_onehot = F.one_hot(label, num_classes=self.num_classes)
                 probs = F.softmax(output, dim=1)
-                true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
-                # calculate CoOp loss
-                # loss_id = F.cross_entropy(output, label)
-                loss_id = - torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
-                loss_id = loss_id.mean()
+                true_probs = torch.gather(
+                    probs, 1, (label.unsqueeze(1)).long()
+                ).squeeze()
+                # calculate cross entropt loss
+                loss_id = F.cross_entropy(output, label)
+
                 # calculate CFR loss
                 loss_cfr = confusable_foreground_rectification_module(
                     output=output, 
@@ -453,9 +455,10 @@ class SCTCoCo(TrainerX):
                     text_sim=text_sim, 
                     label=label, 
                     lambda_value=self.lambda_value,
+                    beta=self.beta_value,
                     num_confuse_classes=self.num_confuse_classes,
                     num_confuse_patches=self.num_confuse_patches,
-                    true_probs=true_probs,
+                    true_probs=true_probs, 
                 )
 
                 # calculate ABS loss
@@ -468,9 +471,10 @@ class SCTCoCo(TrainerX):
                     eta=self.eta
                 )
 
-                # calculate total loss for SCTCoCo
-                loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
-                
+                # # calculate total loss for LOCOOPFOBOR
+                loss = (
+                    loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
+                )
 
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
@@ -479,13 +483,12 @@ class SCTCoCo(TrainerX):
         else:
             output, output_local, text_sim, attn_scores = self.model(image)
 
-            label_onehot = F.one_hot(label, num_classes=self.num_classes)
+            # label_onehot = F.one_hot(label, num_classes=self.num_classes)
             probs = F.softmax(output, dim=1)
             true_probs = torch.gather(probs, 1, (label.unsqueeze(1)).long()).squeeze()
-            # calculate CoOp loss
-            # loss_id = F.cross_entropy(output, label)
-            loss_id = - torch.sum(label_onehot * F.log_softmax(output, dim=1), dim=1) * (1.0000001 - true_probs)
-            loss_id = loss_id.mean()
+            # calculate cross entropt loss
+            loss_id = F.cross_entropy(output, label)
+
             # calculate CFR loss
             loss_cfr = confusable_foreground_rectification_module(
                 output=output, 
@@ -508,7 +511,7 @@ class SCTCoCo(TrainerX):
                 eta=self.eta
             )
 
-            # calculate total loss for SCTCOCO
+            # # calculate total loss for LOCOOPFOBOR
             loss = loss_id + self.alpha_value * loss_abs + self.beta_value * loss_cfr
             self.model_backward_and_update(loss)
 
@@ -562,7 +565,11 @@ class SCTCoCo(TrainerX):
             if "token_suffix" in state_dict:
                 del state_dict["token_suffix"]
 
-            print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            print(
+                'Loading weights to {} from "{}" (epoch = {})'.format(
+                    name, model_path, epoch
+                )
+            )
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
@@ -614,92 +621,13 @@ class SCTCoCo(TrainerX):
             output, output_local, *_ = self.model_inference(images)
             output /= 100.0
             output_local /= 100.0
-            smax_global = to_np(F.softmax(output/T, dim=-1))
-            smax_local = to_np(F.softmax(output_local/T, dim=-1))
+            smax_global = to_np(F.softmax(output / T, dim=-1))
+            smax_local = to_np(F.softmax(output_local / T, dim=-1))
             mcm_global_score = -np.max(smax_global, axis=1)
             mcm_local_score = -np.max(smax_local, axis=(1, 2))
             mcm_score.append(mcm_global_score)
-            glmcm_score.append(mcm_global_score+mcm_local_score)
+            glmcm_score.append(mcm_global_score + mcm_local_score)
 
-        return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(glmcm_score)[:len(data_loader.dataset)].copy()
-
-    @torch.no_grad()
-    def test_visualize(self, img_path, label):
-        """code for visualization results"""
-        self.set_model_mode("eval")
-        self.evaluator.reset()
- 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load("ViT-B/16", device=device)
-
-        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
-        output, output_local, *_ = self.model_inference(image)
-        output=output.softmax(dim=-1)
-        max_index = torch.argmax(output, dim=1)
-        image_i=Image.open(img_path).convert('RGB')
-        # mask = torch.ones(1000, dtype=torch.bool, device=output_local.device)
-        # mask[0] = False  # 排除第 500 类
-
-        # # 选出除了第500类的所有特征：output_local[:,:,mask] => shape (B, D, 999)
-        # # 然后在 dim=2 求平均
-        # mean_except_500 = output_local[:, :, mask].mean(dim=2)  # shape (B, D)
-        # op=mean_except_500
-        op=output_local[:, :, 0]
-        print(op)
-        op=op/100.0
-        print(label)
-        op=(op-op.min())/(op.max()-op.min())
-
-        similarity_map=op
-        # 归一化热图到 0-1
-        similarity_map = similarity_map.view(14, 14)
-        # 假设 similarity_map 是形状为 (14, 14) 的torch张量
-        similarity_map = similarity_map.float()  # 确保是浮点类型
-
-        # 归一化到 [0, 1] 范围
-        similarity_map = (similarity_map - similarity_map.min()) / (
-            similarity_map.max() - similarity_map.min() + 1e-8
-        )  # 加1e-8避免除以0
-        # similarity_map=similarity_map**1.5
-        # 使用双线性插值放大到224x224
-        attention_map = F.interpolate(
-            similarity_map.unsqueeze(0).unsqueeze(0),  # 添加batch和channel维度 (1,1,14,14)
-            size=(224, 224),
-            mode="bilinear",
-            align_corners=False
-        ).squeeze(0).squeeze(0)  # 回到(224,224)
-
-        # 转换为numpy并准备热力图
-        attention_map_np = attention_map.cpu().numpy()
-        heatmap = np.uint8(255 * attention_map_np)  # 转换为0-255范围
-        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-
-        # 处理原始图像
-        image_np = np.array(image_i)  # 假设image_i是PIL图像
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)  # 转为BGR
-        image_np = cv2.resize(image_np, (224, 224))  # 确保尺寸匹配
-
-        # 叠加热力图和原图
-        superimposed_img = cv2.addWeighted(heatmap, 0.5, image_np, 0.5, 0)
-
-        # 保存结果
-        # cv2.imwrite('attention_map.jpg', superimposed_img)
-
-        # input()
-
-
-        num_regions = output_local.shape[1]
-        label = torch.tensor(label).cuda()
-        label_repeat = label.repeat_interleave(num_regions)
-        print(output_local[:,:,0])
-        print(output_local[:,:,5])
-        output_local = F.softmax(output_local, dim=-1)
-        print(output_local[:,:,0])
-        print(output_local[:,:,5])
-        output_local = output_local.view(num_regions, -1)  # [num_regions, num_classes]
-        # -----top 200--------
-        pred_topk = torch.topk(output_local, k=200, dim=-1)[1]
-        contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(dim=1)
-        print(contains_label)
-        # input()
-        return contains_label
+        return concat(mcm_score)[: len(data_loader.dataset)].copy(), concat(
+            glmcm_score
+        )[: len(data_loader.dataset)].copy()
